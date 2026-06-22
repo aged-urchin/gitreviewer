@@ -115,6 +115,7 @@ class CreateSessionResponse(BaseModel):
 class SubmitReviewRequest(BaseModel):
     description: str = Field("", description="Review 描述，告诉模型关注什么；留空则默认 review 整个仓库")
     patch: str = Field("", description="本地未提交的 diff（客户端自动检测并附带）")
+    no_poll: bool = Field(False, description="客户端不轮询，服务端跑完为止")
     webhook_url: str = Field("", description="可选的回调 URL，review 完成后 POST 通知")
 
 
@@ -265,6 +266,7 @@ async def api_submit_review(
         review=review,
         description=body.description,
         patch=body.patch,
+        keepalive=not body.no_poll,
         webhook_url=body.webhook_url,
     )
 
@@ -323,6 +325,10 @@ async def api_get_review(
     review = session.get_review(review_id)
     if review is None:
         raise HTTPException(status_code=404, detail="Review not found")
+
+    # 通知 worker：客户端还在轮询
+    worker = get_worker()
+    worker.touch(review_id)
 
     return review.to_dict()
 

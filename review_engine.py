@@ -1,8 +1,5 @@
 """
 Review 引擎 — 通过 Claude Code CLI 执行代码 review。
-
-Claude Code 在目标仓库目录中运行，可以自由使用 git、读文件等工具，
-根据用户的描述自行决定 review 范围和重点。
 """
 import asyncio
 import json
@@ -16,37 +13,38 @@ from models import Finding
 
 logger = logging.getLogger("gitreviewer.review_engine")
 
-CLAUDE_TIMEOUT = 600  # agent 模式可能多轮，放宽超时
+CLAUDE_TIMEOUT = 600
 
 
 def _find_claude() -> str:
-    for candidate in [
-        shutil.which("claude"),
-        str(Path(os.environ.get("APPDATA", "")) / "npm" / "claude.cmd"),
-        str(Path(os.environ.get("APPDATA", "")) / "npm" / "claude.ps1"),
-    ]:
-        if candidate and Path(candidate).exists():
-            return candidate
+    # 1) PATH 中查找（跨平台）
+    found = shutil.which("claude")
+    if found:
+        return found
 
-    raise FileNotFoundError(
-        "Claude Code CLI not found.\n"
-        "Install: npm install -g @anthropic-ai/claude-code"
-    )
+    # 2) npm 全局目录（Windows）
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        for name in ["claude.cmd", "claude", "claude.ps1"]:
+            p = Path(appdata) / "npm" / name
+            if p.exists():
+                return str(p)
 
+    # 3) npm 全局目录（Unix）
+    for prefix in [os.path.expanduser("~/.npm-global/bin"), "/usr/local/bin", "/usr/bin"]:
+        p = Path(prefix) / "claude"
+        if p.exists():
+            return str(p)
 
-# ---------------------------------------------------------------------------
-# Prompt
-# ---------------------------------------------------------------------------
+    raise FileNotFoundError("Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code")
+
 
 SYSTEM_INSTRUCTION = """You are a code reviewer. You are in a git repository. Use git commands (log, diff, show, etc.) and read files to understand the code and complete the review task described below. When you are done, output your findings as the JSON object specified. Answer in Simplified Chinese (简体中文)."""
 
 
 def _build_prompt(description: str) -> str:
     parts = [SYSTEM_INSTRUCTION, "", "## Task"]
-    if description:
-        parts.append(description)
-    else:
-        parts.append("Review this codebase for bugs, security issues, and design problems.")
+    parts.append(description if description else "Review this codebase for bugs, security issues, and design problems.")
     parts.append("")
     parts.append(
         "## Output Format (MUST follow exactly, use Simplified Chinese 简体中文)\n"
@@ -65,93 +63,39 @@ def _build_prompt(description: str) -> str:
     return "\n".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Claude Code 调用
-# ---------------------------------------------------------------------------
-
-async def _call_claude(prompt: str, repo_dir: Path) -> str:
-    claude_path = _find_claude()
-    cmd = [claude_path, "--print"]
-
-    logger.info(f"Calling Claude Code agent in: {repo_dir}")
-
-    loop = asyncio.get_running_loop()
-
-    try:
-        process = await loop.run_in_executor(
-            None,
-            lambda: subprocess.run(
-                cmd,
-                cwd=str(repo_dir),
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=CLAUDE_TIMEOUT,
-                encoding="utf-8",
-                errors="replace",
-            ),
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Claude Code timed out after {CLAUDE_TIMEOUT}s")
-    except FileNotFoundError:
-        raise RuntimeError("Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code")
-
-    if process.returncode != 0:
-        stderr = process.stderr.strip() or process.stdout.strip()
-        raise RuntimeError(f"Claude Code exited with {process.returncode}: {stderr[:500]}")
-
-    return process.stdout.strip()
-
-
-# ---------------------------------------------------------------------------
-# 解析
-# ---------------------------------------------------------------------------
-
 def _parse_output(raw: str) -> tuple[list[Finding], str]:
     candidates: list[str] = []
     text = raw.strip()
-
     candidates.append(text)
-
     for m in re.finditer(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL):
         candidates.append(m.group(1))
-
     for m in re.finditer(r"\{", text):
         depth = 0
         for i in range(m.start(), len(text)):
-            if text[i] == "{":
-                depth += 1
+            if text[i] == "{": depth += 1
             elif text[i] == "}":
                 depth -= 1
                 if depth == 0:
-                    candidates.append(text[m.start() : i + 1])
-                    break
-
+                    candidates.append(text[m.start() : i + 1]); break
     for c in candidates:
         c = c.strip()
-        if not c:
-            continue
+        if not c: continue
         try:
             data = json.loads(c)
             if isinstance(data, dict) and "findings" in data:
-                findings = [
-                    Finding(
-                        severity=f.get("severity", "low"),
-                        category=f.get("category", "style"),
-                        file=f.get("file", ""),
-                        line=int(f.get("line", 0)),
-                        title=f.get("title", "Untitled"),
-                        description=f.get("description", ""),
-                        suggestion=f.get("suggestion", ""),
-                    )
-                    for f in data["findings"]
-                    if isinstance(f, dict)
-                ]
+                findings = [Finding(
+                    severity=f.get("severity","low"), category=f.get("category","style"),
+                    file=f.get("file",""), line=int(f.get("line",0)), title=f.get("title","Untitled"),
+                    description=f.get("description",""), suggestion=f.get("suggestion",""),
+                ) for f in data["findings"] if isinstance(f, dict)]
                 return findings, data.get("summary", "")
-        except (json.JSONDecodeError, ValueError, KeyError):
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON parse failed (len={len(c)}): {e} | first 100 chars: {c[:100]}")
             continue
-
-    logger.warning(f"Could not parse output. Preview: {text[:300]}")
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Parse exception: {e}")
+            continue
+    logger.warning(f"Could not parse output. text_len={len(text)} preview={text[:200]}")
     return [], text[:500]
 
 
@@ -159,16 +103,39 @@ def _parse_output(raw: str) -> tuple[list[Finding], str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def run_review(description: str, repo_dir: Path) -> tuple[list[Finding], str]:
-    """在 repo_dir 中启动 Claude Code agent，按 description 执行 review。"""
+async def launch_review(description: str, repo_dir: Path) -> asyncio.subprocess.Process:
+    """启动 Claude Code 子进程并立即发送 prompt，返回 Process 句柄。"""
+    claude_path = _find_claude()
     prompt = _build_prompt(description)
+    logger.info(f"Launching Claude Code agent in: {repo_dir}")
+    process = await asyncio.create_subprocess_exec(
+        claude_path, "--print",
+        cwd=str(repo_dir),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    # 立即发送 prompt，避免 Claude Code 等 stdin 超时
+    process.stdin.write(prompt.encode("utf-8"))
+    await process.stdin.drain()
+    process.stdin.close()
+    return process
 
-    logger.info(f"Starting review in {repo_dir}: {description[:80]}")
 
-    raw = await _call_claude(prompt, repo_dir)
+async def read_review_output(process: asyncio.subprocess.Process) -> tuple[list[Finding], str]:
+    """等待 Claude Code 结束，读取并解析输出。"""
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=CLAUDE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        raise RuntimeError(f"Claude Code timed out after {CLAUDE_TIMEOUT}s")
 
-    findings, summary = _parse_output(raw)
+    if process.returncode != 0:
+        err = (stderr or stdout).decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"Claude Code exited with {process.returncode}: {err}")
 
-    logger.info(f"Review done: {len(findings)} findings, summary={summary[:80] if summary else 'N/A'}")
-
-    return findings, summary
+    return _parse_output(stdout.decode("utf-8", errors="replace"))

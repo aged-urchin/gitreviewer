@@ -9,7 +9,7 @@ from typing import Optional
 
 from config import MAX_CONCURRENT_REVIEWS
 from models import Review, _now, _uid
-from review_engine import run_review
+from review_engine import launch_review, read_review_output
 from git_manager import apply_patch, GitError
 from session_manager import (
     add_review, update_review, get_session,
@@ -31,6 +31,7 @@ class ReviewTask:
     ))
     description: str = ""
     patch: str = ""
+    keepalive: bool = True   # False → 客户端不轮询，服务端跑完为止
     webhook_url: str = ""
 
 
@@ -40,9 +41,15 @@ class TaskWorker:
     def __init__(self):
         self._queue: asyncio.Queue[ReviewTask] = asyncio.Queue()
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_REVIEWS)
-        self._session_locks: dict[str, asyncio.Lock] = {}  # 同一 session 内串行处理
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._last_poll: dict[str, float] = {}  # review_id → 最近一次轮询时间
         self._running = False
         self._task: Optional[asyncio.Task] = None
+
+    def touch(self, review_id: str):
+        """客户端轮询了一次，更新心跳时间"""
+        import time
+        self._last_poll[review_id] = time.time()
 
     def _get_session_lock(self, session_id: str) -> asyncio.Lock:
         """获取 per-session 锁，确保同一 session 的 review 串行执行"""
@@ -107,6 +114,14 @@ class TaskWorker:
 
                 repo_dir = _repo_dir(session_id)
 
+                # 确定 review 范围
+                if task.patch:
+                    review.scope = "local uncommitted changes"
+                elif task.description and task.description != "Review the last commit (git diff HEAD~1)":
+                    review.scope = f"agent-driven: {task.description[:80]}"
+                else:
+                    review.scope = "last commit (HEAD~1)"
+
                 try:
                     # 如果有本地未提交改动，先 apply 到工作区
                     if task.patch:
@@ -114,21 +129,47 @@ class TaskWorker:
                         await asyncio.get_running_loop().run_in_executor(
                             None, apply_patch, repo_dir, task.patch, patch_file
                         )
-                        try:
-                            patch_file.unlink()
-                        except Exception:
-                            pass
+                        try: patch_file.unlink()
+                        except Exception: pass
 
-                    # Claude Code agent 在 repo 目录中自行探索，按描述 review
-                    findings, summary = await run_review(
-                        description=task.description,
-                        repo_dir=repo_dir,
-                    )
+                    import time
+                    KEEPALIVE_TIMEOUT = 10  # 客户端超过 30s 未轮询则停止
 
-                    review.findings = findings
-                    review.summary = summary
-                    review.status = "completed"
-                    review.completed_at = _now()
+                    process = await launch_review(task.description, repo_dir)
+
+                    if task.keepalive:
+                        # 轮询模式：边等 Claude Code 边检查客户端是否还在
+                        cancelled = False
+                        while True:
+                            await asyncio.sleep(3)
+                            # Claude Code 跑完了？
+                            if process.returncode is not None:
+                                break
+                            # 客户端还在吗？
+                            last = self._last_poll.get(review.review_id, 0)
+                            if time.time() - last > KEEPALIVE_TIMEOUT:
+                                process.kill()
+                                await process.wait()
+                                cancelled = True
+                                break
+
+                        if cancelled:
+                            review.status = "cancelled"
+                            review.summary = "Client disconnected, review cancelled."
+                            review.completed_at = _now()
+                        else:
+                            findings, summary = await read_review_output(process)
+                            review.findings = findings
+                            review.summary = summary
+                            review.status = "completed"
+                            review.completed_at = _now()
+                    else:
+                        # NoPoll 模式：跑完为止，不检查客户端
+                        findings, summary = await read_review_output(process)
+                        review.findings = findings
+                        review.summary = summary
+                        review.status = "completed"
+                        review.completed_at = _now()
 
                 except GitError as e:
                     review.status = "failed"

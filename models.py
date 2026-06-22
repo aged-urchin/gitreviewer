@@ -47,9 +47,10 @@ class Finding:
 class Review:
     review_id: str
     description: str
-    status: str         # "queued" | "processing" | "completed" | "failed"
+    status: str         # "queued" | "processing" | "completed" | "failed" | "cancelled"
     created_at: str
     completed_at: Optional[str] = None
+    scope: str = ""     # 本次 review 覆盖的范围，如 "all commits (root..HEAD)"
     findings: list[Finding] = field(default_factory=list)
     summary: str = ""
     error: str = ""
@@ -61,6 +62,7 @@ class Review:
         d["status"] = self.status
         d["created_at"] = self.created_at
         d["completed_at"] = self.completed_at
+        d["scope"] = self.scope
         d["findings"] = [f.to_dict() for f in self.findings]
         d["summary"] = self.summary
         d["error"] = self.error
@@ -75,6 +77,7 @@ class Review:
             status=d.get("status", "queued"),
             created_at=d.get("created_at", ""),
             completed_at=d.get("completed_at"),
+            scope=d.get("scope", ""),
             findings=findings,
             summary=d.get("summary", ""),
             error=d.get("error", ""),

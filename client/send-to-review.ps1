@@ -16,7 +16,7 @@ param(
 
     [switch]$local,
 
-    [int]$PollInterval = 5,
+    [int]$PollInterval = 2,
 
     [switch]$NoPoll,
 
@@ -58,14 +58,30 @@ if (-not $gitRemote) { Write-Color "ERROR: no origin remote" "Red"; exit 1 }
 $gitBranch = (git branch --show-current 2>$null)
 if (-not $gitBranch) { Write-Color "ERROR: not on a branch" "Red"; exit 1 }
 
-# -- 2. Session --
+# -- 2. Validate --
+if ($local -and -not $des) {
+    Write-Color "ERROR: -local requires -des to describe what was changed" "Red"; exit 1
+}
+if (-not $des -and -not $local) {
+    $des = "Review the last commit (git diff HEAD~1)"
+    Write-Color "Default: review last commit" "Gray"
+}
+
+# -- 3. Session --
 $sessionFile = Join-Path (Get-Location) ".gitreviewer_session"
+$cachedServer = $null
 if (Test-Path $sessionFile) {
-    $sessionId = (Get-Content $sessionFile -Raw).Trim()
-    Write-Color "Session: $sessionId" "Gray"
     try {
-        $session = Invoke-API -Method Get -Path "/api/v1/sessions/$sessionId" -Timeout 10
-        if ($session.status -eq "closed") {
+        $cached = Get-Content $sessionFile -Raw | ConvertFrom-Json
+        $sessionId = $cached.session_id
+        $cachedServer = $cached.server
+        # 未指定 -Server 则复用缓存的地址
+        if (-not $PSBoundParameters.ContainsKey('Server') -and $cachedServer) {
+            $Server = $cachedServer
+        }
+        Write-Color "Session: $sessionId @ $Server" "Gray"
+        $s = Invoke-API -Method Get -Path "/api/v1/sessions/$sessionId" -Timeout 10
+        if ($s.status -eq "closed") {
             Write-Color "Session closed, creating new..." "Yellow"
             Remove-Item $sessionFile -Force; $sessionId = $null
         }
@@ -75,10 +91,10 @@ if (Test-Path $sessionFile) {
     }
 }
 if (-not $sessionId) {
-    Write-Color "Creating session for $gitRemote ($gitBranch)..." "Cyan"
+    Write-Color "Creating session for $gitRemote ($gitBranch) @ $Server ..." "Cyan"
     $s = Invoke-API -Method Post -Path "/api/v1/sessions" -Body (@{ git_url = $gitRemote; branch = $gitBranch }) -Timeout 120
     $sessionId = $s.session_id
-    $sessionId | Out-File $sessionFile -NoNewline -Encoding utf8
+    @{ session_id = $sessionId; server = $Server } | ConvertTo-Json -Compress | Out-File $sessionFile -NoNewline -Encoding utf8
     Write-Color "Session: $sessionId ($($s.status))" "Green"
 }
 
@@ -91,6 +107,9 @@ if ($local) {
     $reviewBody["patch"] = $patch
     Write-Color "Including local diff ($($patch.Length) chars)" "Yellow"
 }
+if ($NoPoll) {
+    $reviewBody["no_poll"] = $true
+}
 $review = Invoke-API -Method Post -Path "/api/v1/sessions/$sessionId/reviews" -Body $reviewBody
 $reviewId = $review.review_id
 Write-Color "Review: $reviewId ($($review.status))" "Green"
@@ -102,15 +121,20 @@ if ($NoPoll) {
 }
 Write-Color "Waiting..." "Cyan"
 $waited = 0
+$prevStatus = "queued"
 do {
     Start-Sleep -Seconds $PollInterval; $waited += $PollInterval
     $result = Invoke-API -Method Get -Path "/api/v1/sessions/$sessionId/reviews/$reviewId" -Timeout 10
-    if ($waited % 10 -eq 0) { Write-Host -NoNewline "." }
-    if ($result.status -eq "completed" -or $result.status -eq "failed") { break }
+    if ($result.status -ne $prevStatus) {
+        Write-Host ""
+        Write-Host -NoNewline "$($prevStatus)->$($result.status)"
+        $prevStatus = $result.status
+    } else {
+        Write-Host -NoNewline "."
+    }
+    if ($result.status -eq "completed" -or $result.status -eq "failed" -or $result.status -eq "cancelled") { break }
     if ($waited -ge 300) {
-        Write-Color "Timeout (${waited}s)" "Yellow"
-        Write-Color "Check: GET $Server/api/v1/sessions/$sessionId/reviews/$reviewId" "Cyan"
-        exit 0
+        Write-Color "`nTimeout (${waited}s)" "Yellow"; exit 0
     }
 } while ($true)
 Write-Host ""
@@ -122,6 +146,7 @@ if ($result.status -eq "failed") {
 Write-Color "========================================" "White"
 Write-Color "  Review Complete" "White"
 Write-Color "========================================" "White"
+if ($result.scope) { Write-Color "Scope: $($result.scope)" "Gray" }
 Write-Color "Summary: $($result.summary)" "Cyan"
 Write-Color "Findings: $($result.findings.Count)" "Yellow"
 Write-Color "========================================" "White"
