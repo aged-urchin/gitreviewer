@@ -39,33 +39,46 @@ def _find_claude() -> str:
     raise FileNotFoundError("Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code")
 
 
-SYSTEM_INSTRUCTION = """You are a code reviewer. You are in a git repository. Use git commands (log, diff, show, etc.) and read files to understand the code and complete the review task described below. When you are done, output your findings as the JSON object specified. Answer in Simplified Chinese (简体中文)."""
+SYSTEM_INSTRUCTION = """You are a code reviewer. You are in a git repository. Use git commands (log, diff, show, etc.) and read files to understand the code and complete the review task described below. Answer in Simplified Chinese (简体中文)."""
 
 
-def _build_prompt(description: str) -> str:
+def _build_prompt(description: str, fast_mode: bool = False) -> str:
     parts = [SYSTEM_INSTRUCTION, "", "## Task"]
     parts.append(description if description else "Review this codebase for bugs, security issues, and design problems.")
     parts.append("")
-    parts.append(
-        "## Output Format (MUST follow exactly, use Simplified Chinese 简体中文)\n"
-        "When done, output ONLY a JSON object, no markdown fences:\n"
-        '{"summary":"<summary in Chinese>",'
-        '"findings":['
-        '{"severity":"high|medium|low",'
-        '"category":"bug|security|style|performance",'
-        '"file":"path/to/file",'
-        '"line":42,'
-        '"title":"short title",'
-        '"description":"what is wrong",'
-        '"suggestion":"how to fix"}]}\n'
-        "If no issues, use empty findings array."
-    )
+    if fast_mode:
+        parts.append(
+            "## Output Format (MUST use Simplified Chinese 简体中文)\n"
+            "FAST MODE: Please output a brief, free-form text summary of your findings. "
+            "Do NOT output the strict JSON format. Just describe any issues concisely."
+        )
+    else:
+        parts.append(
+            "## Output Format (MUST follow exactly, use Simplified Chinese 简体中文)\n"
+            "When you are done, output your findings as the JSON object specified.\n"
+            "When done, output ONLY a JSON object, no markdown fences:\n"
+            '{"summary":"<summary in Chinese>",'
+            '"findings":['
+            '{"severity":"high|medium|low",'
+            '"category":"bug|security|style|performance",'
+            '"file":"path/to/file",'
+            '"line":42,'
+            '"title":"short title",'
+            '"description":"what is wrong",'
+            '"suggestion":"how to fix"}]}\n'
+            "If no issues, use empty findings array."
+        )
     return "\n".join(parts)
 
 
-def _parse_output(raw: str) -> tuple[list[Finding], str]:
-    candidates: list[str] = []
+def _parse_output(raw: str, fast_mode: bool = False) -> tuple[list[Finding], str]:
     text = raw.strip()
+    if fast_mode:
+        # Claude 有时会在混合指令下输出字面量 \n，这里做一下清理
+        text = text.replace("\\n\n", "\n").replace("\\n", "\n")
+        return [], text
+
+    candidates: list[str] = []
     candidates.append(text)
     for m in re.finditer(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL):
         candidates.append(m.group(1))
@@ -77,6 +90,7 @@ def _parse_output(raw: str) -> tuple[list[Finding], str]:
                 depth -= 1
                 if depth == 0:
                     candidates.append(text[m.start() : i + 1]); break
+    last_error = None
     for c in candidates:
         c = c.strip()
         if not c: continue
@@ -90,11 +104,14 @@ def _parse_output(raw: str) -> tuple[list[Finding], str]:
                 ) for f in data["findings"] if isinstance(f, dict)]
                 return findings, data.get("summary", "")
         except json.JSONDecodeError as e:
-            logger.warning(f"JSON parse failed (len={len(c)}): {e} | first 100 chars: {c[:100]}")
+            last_error = f"JSON parse failed (len={len(c)}): {e} | first 100 chars: {c[:100]}"
             continue
         except (ValueError, KeyError) as e:
-            logger.warning(f"Parse exception: {e}")
+            last_error = f"Parse exception: {e}"
             continue
+            
+    if last_error:
+        logger.warning(last_error)
     logger.warning(f"Could not parse output. text_len={len(text)} preview={text[:200]}")
     return [], text[:500]
 
@@ -103,17 +120,22 @@ def _parse_output(raw: str) -> tuple[list[Finding], str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def launch_review(description: str, repo_dir: Path) -> asyncio.subprocess.Process:
+async def launch_review(description: str, repo_dir: Path, fast_mode: bool = False) -> asyncio.subprocess.Process:
     """启动 Claude Code 子进程并立即发送 prompt，返回 Process 句柄。"""
     claude_path = _find_claude()
-    prompt = _build_prompt(description)
+    prompt = _build_prompt(description, fast_mode)
     logger.info(f"Launching Claude Code agent in: {repo_dir}")
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NO_WINDOW
+
     process = await asyncio.create_subprocess_exec(
         claude_path, "--print",
         cwd=str(repo_dir),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        creationflags=creationflags,
     )
     # 立即发送 prompt，避免 Claude Code 等 stdin 超时
     process.stdin.write(prompt.encode("utf-8"))
@@ -122,7 +144,7 @@ async def launch_review(description: str, repo_dir: Path) -> asyncio.subprocess.
     return process
 
 
-async def read_review_output(process: asyncio.subprocess.Process) -> tuple[list[Finding], str]:
+async def read_review_output(process: asyncio.subprocess.Process, fast_mode: bool = False) -> tuple[list[Finding], str]:
     """等待 Claude Code 结束，读取并解析输出。"""
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -138,4 +160,4 @@ async def read_review_output(process: asyncio.subprocess.Process) -> tuple[list[
         err = (stderr or stdout).decode("utf-8", errors="replace")[:500]
         raise RuntimeError(f"Claude Code exited with {process.returncode}: {err}")
 
-    return _parse_output(stdout.decode("utf-8", errors="replace"))
+    return _parse_output(stdout.decode("utf-8", errors="replace"), fast_mode)

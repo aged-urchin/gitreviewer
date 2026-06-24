@@ -27,27 +27,27 @@
 
 ### 2. 安装
 
-```powershell
-cd d:\work\experiment\gitreviewer
+```bash
+cd /path/to/gitreviewer
 
 # 创建虚拟环境（推荐）
 python -m venv venv
-.\venv\Scripts\Activate.ps1
+source venv/bin/activate
 
 # 安装 Python 依赖
 pip install -r requirements.txt
 
 # 创建 GitReviewer 配置
-copy .env.example .env
+cp .env.example .env
 ```
 
 ### 3. 配置 Claude Code 后端
 
 GitReviewer 本身不持有任何 API 凭据。Claude Code 的后端由用户在其 `~/.claude/settings.json` 中配置，可以是 Anthropic 官方 API，也可以是任何 Anthropic 兼容端点（如 DeepSeek `/anthropic`、自建代理等）。
 
-```powershell
+```bash
 # 编辑 Claude Code 全局配置
-notepad $env:USERPROFILE\.claude\settings.json
+nano ~/.claude/settings.json
 ```
 
 示例——使用 DeepSeek 作为后端：
@@ -67,13 +67,13 @@ notepad $env:USERPROFILE\.claude\settings.json
 
 验证配置：
 
-```powershell
+```bash
 echo 'reply OK' | claude --print --max-turns 1
 ```
 
 ### 4. 启动服务
 
-```powershell
+```bash
 # 直接启动
 python server.py
 
@@ -87,45 +87,32 @@ uvicorn server:app --host 0.0.0.0 --port 8000
 
 ### 创建会话
 
-```powershell
-$session = Invoke-RestMethod -Uri "http://localhost:8000/api/v1/sessions" `
-    -Method Post `
-    -Body '{"git_url":"https://github.com/user/repo.git","branch":"main"}' `
-    -ContentType "application/json"
+### 创建会话
 
-$sessionId = $session.session_id
+```bash
+curl -X POST "http://localhost:8000/api/v1/sessions" \
+     -H "Content-Type: application/json" \
+     -d '{"git_url":"https://github.com/user/repo.git","branch":"main"}'
 ```
 
 ### 提交 Review
 
-```powershell
-$patch = git diff HEAD~1
-
-$review = Invoke-RestMethod -Uri "http://localhost:8000/api/v1/sessions/$sessionId/reviews" `
-    -Method Post `
-    -Body (@{patch=$patch; description="检查登录模块的安全性"} | ConvertTo-Json) `
-    -ContentType "application/json"
-
-$reviewId = $review.review_id
+```bash
+curl -X POST "http://localhost:8000/api/v1/sessions/$SESSION_ID/reviews" \
+     -H "Content-Type: application/json" \
+     -d '{"description":"检查登录模块的安全性"}'
 ```
 
 ### 轮询结果
 
-```powershell
-# 每 5 秒轮询一次
-do {
-    Start-Sleep 5
-    $result = Invoke-RestMethod -Uri "http://localhost:8000/api/v1/sessions/$sessionId/reviews/$reviewId"
-} while ($result.status -eq "queued" -or $result.status -eq "processing")
-
-# 输出 findings
-$result.findings | Format-Table severity, category, file, line, title
+```bash
+curl "http://localhost:8000/api/v1/sessions/$SESSION_ID/reviews/$REVIEW_ID"
 ```
 
 ### 结束会话
 
-```powershell
-Invoke-RestMethod -Uri "http://localhost:8000/api/v1/sessions/$sessionId" -Method Delete
+```bash
+curl -X DELETE "http://localhost:8000/api/v1/sessions/$SESSION_ID"
 ```
 
 ### 完整示例
@@ -134,8 +121,8 @@ Invoke-RestMethod -Uri "http://localhost:8000/api/v1/sessions/$sessionId" -Metho
 
 **1. 首次 review——提交最近一次 commit：**
 
-```powershell
-PS D:\work\myproject> .\send-to-review.ps1 -des "review 最近一次 commit，重点检查安全性"
+```bash
+$ ./send-to-review.sh -d "review 最近一次 commit，重点检查安全性"
 
 Creating session for https://github.com/user/myproject.git (main)...
 Session: a1b2c3d4e5f6 (ready)
@@ -170,15 +157,15 @@ Summary: 1 high, 1 medium, 1 low
 
 **2. 根据 findings 修改代码**，修复 SQL 注入和密码哈希问题后 commit：
 
-```powershell
+```bash
 git add src/auth.py
 git commit -m "fix: 修复 SQL 注入和密码明文存储"
 ```
 
 **3. 复查修改结果：**
 
-```powershell
-PS D:\work\myproject> .\send-to-review.ps1 -des "review 修复 SQL 注入和密码哈希的改动，确认安全问题已解决"
+```bash
+$ ./send-to-review.sh -d "review 修复 SQL 注入和密码哈希的改动，确认安全问题已解决"
 
 Session: a1b2c3d4e5f6 @ http://gitreviewer-pc:8000   # 复用已有 session
 Submitting review...
@@ -200,68 +187,69 @@ Summary: 0 high, 0 medium, 1 low
 
 **4. 确认高危和中危问题已修复，结束 session：**
 
-```powershell
-PS D:\work\myproject> .\send-to-review.ps1 -EndSession
+```bash
+$ ./send-to-review.sh -e
 
 Session ended
 ```
 
 ## 客户端脚本
 
-提供 PowerShell（`client/send-to-review.ps1`）和 Bash（`client/send-to-review.sh`）两个客户端脚本，功能完全相同。放入目标 git 工程目录后使用。脚本会缓存 session，同一工程只 clone 一次。
+提供 Bash 客户端脚本（`client/send-to-review.sh`）。放入目标 git 工程目录后使用。脚本会缓存 session，同一工程只 clone 一次。
 
 ### 场景一：本地有未提交的改动
 
-**只 review 本地改动**（必须跟上 `-des` 描述改了什么）：
+**只 review 本地改动**（必须跟上 `-d` 描述改了什么）：
 
-```powershell
-.\send-to-review.ps1 -local -des "修复了用户登录时的空指针异常"
-.\send-to-review.ps1 -local -des "重构数据库连接池，改为单例模式"
+```bash
+./send-to-review.sh -l -d "修复了用户登录时的空指针异常"
+./send-to-review.sh -l -d "重构数据库连接池，改为单例模式"
 ```
 
-脚本自动将 `git diff HEAD` 发给服务端 apply 后再 review。不加 `-local` 则忽略本地改动，走场景二。
+脚本自动将 `git diff HEAD` 发给服务端 apply 后再 review。不加 `-l` 则忽略本地改动，走场景二。
 
 ### 场景二：工作区干净（或忽略本地改动）
 
-**有 `-des`**：服务端根据描述指令操作。
+**有 `-d`**：服务端根据描述指令操作。
 
-```powershell
-.\send-to-review.ps1 -des "review 最近 3 次提交，重点检查安全问题"
-.\send-to-review.ps1 -des "检查 src/auth 目录的权限校验逻辑"
-.\send-to-review.ps1 -des "review 整个工程，找出设计缺陷并给出改进建议"
-.\send-to-review.ps1 -des "review main..feature 分支的差异"
+```bash
+./send-to-review.sh -d "review 最近 3 次提交，重点检查安全问题"
+./send-to-review.sh -d "检查 src/auth 目录的权限校验逻辑"
+./send-to-review.sh -d "review 整个工程，找出设计缺陷并给出改进建议"
+./send-to-review.sh -d "review main..feature 分支的差异"
 ```
 
-**没有 `-des`**：默认 review 最近一次 commit。
+**没有 `-d`**：默认 review 最近一次 commit。
 
-```powershell
-.\send-to-review.ps1
+```bash
+./send-to-review.sh
 ```
 
-效果等同于 `-des "Review the last commit (git diff HEAD~1)"`。
+效果等同于 `-d "Review the last commit (git diff HEAD~1)"`。
 
 ### 常用参数
 
 | 参数 | 说明 |
 |------|------|
-| `-des` | review 描述/指令，别名 `-Description` |
-| `-local` | 附带本地未提交改动，必须同时给 `-des` |
-| `-Server` | 服务端地址，默认 `http://localhost:8000` |
-| `-NoPoll` | 只提交不等待结果 |
-| `-EndSession` | review 完后清理服务端 session |
-| `-PollInterval` | 轮询间隔秒数，默认 2 |
+| `-d, --des` | review 描述/指令 |
+| `-l, --local` | 附带本地未提交改动，必须同时给 `-d` |
+| `-s, --server` | 服务端地址，默认 `http://localhost:8000` |
+| `-n, --no-poll` | 只提交不等待结果 |
+| `-e, --end-session` | review 完后清理服务端 session |
+| `-p, --poll-interval` | 轮询间隔秒数，默认 2 |
+| `-f, --fast` | 快速模式，不输出严格 JSON |
 
 ### `.gitreviewer_session`
 
-脚本首次运行时会在当前目录自动创建 `.gitreviewer_session`，缓存 session_id 和服务器地址，之后无需重复指定 `-Server`。文件内容为 JSON：
+脚本首次运行时会在当前目录自动创建 `.gitreviewer_session`，缓存 session_id 和服务器地址，之后无需重复指定 `-s`。文件内容为 JSON：
 
 ```json
 {"session_id": "517f130696e6", "server": "http://gitreviewer-pc:8000"}
 ```
 
 - **复用 session**：同一工程后续调用跳过 clone，直接复用已有仓库
-- **切换服务器**：再次指定 `-Server` 会覆盖缓存
-- **结束 session**：`-EndSession` 会删除此文件并清理服务端
+- **切换服务器**：再次指定 `-s` 会覆盖缓存
+- **结束 session**：`-e` 会删除此文件并清理服务端
 - **手动切换项目**：删除此文件即可从零开始
 - 建议加入 `.gitignore`（服务端信息不应提交）
 
@@ -269,13 +257,13 @@ Session ended
 
 客户端默认每 2 秒轮询一次结果。服务端在 review 执行期间持续检查心跳——若客户端 **超过 10 秒未轮询**（如关闭了终端），服务端会终止当前 review，任务状态变为 `cancelled`。
 
-使用 `-NoPoll` 则跳过轮询，服务端不受影响，review 会跑完为止。
+使用 `-n` 则跳过轮询，服务端不受影响，review 会跑完为止。
 
 ### Codex 集成
 
-将 `send-to-review.ps1` 放入 Codex 工作的 repo，在 Codex 的项目配置中加入：
+将 `send-to-review.sh` 放入 Codex 工作的 repo，在 Codex 的项目配置中加入：
 
-> 完成功能变更后运行 `.\send-to-review.ps1 -local -des "<change summary>"`，等待结果并根据 findings 修复问题后再提交。
+> 完成功能变更后运行 `./send-to-review.sh -l -d "<change summary>"`，等待结果并根据 findings 修复问题后再提交。
 
 ## 配置项
 
@@ -313,7 +301,6 @@ gitreviewer/
 ├── requirements.txt       # Python 依赖
 ├── .env.example           # 配置模板
 ├── client/
-│   ├── send-to-review.ps1  # PowerShell 客户端
 │   └── send-to-review.sh   # Bash 客户端
 ├── workspaces/            # 运行时创建的 session 目录
 └── README.md

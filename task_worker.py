@@ -32,6 +32,7 @@ class ReviewTask:
     description: str = ""
     patch: str = ""
     keepalive: bool = True   # False → 客户端不轮询，服务端跑完为止
+    fast_mode: bool = False
     webhook_url: str = ""
 
 
@@ -45,6 +46,27 @@ class TaskWorker:
         self._last_poll: dict[str, float] = {}  # review_id → 最近一次轮询时间
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._processing_count = 0
+        self._completed_count = 0
+        self._update_title()
+
+    def _update_title(self):
+        import sys
+        queued = self._queue.qsize()
+        processing = self._processing_count
+        completed = self._completed_count
+        
+        title = f"GitReviewer - Processing: {processing} | Completed: {completed} | Queued: {queued}"
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(title)
+        else:
+            sys.stdout.write(f"\033]0;{title}\007")
+            
+        if self._running:
+            sys.stdout.write(f"\033[s\033[1;1H\033[2K\033[44;37m GitReviewer Tasks | Processing: {processing} | Queued: {queued} | Completed: {completed} \033[0m\033[u")
+            
+        sys.stdout.flush()
 
     def touch(self, review_id: str):
         """客户端轮询了一次，更新心跳时间"""
@@ -62,6 +84,15 @@ class TaskWorker:
         if self._running:
             return
         self._running = True
+        
+        import os
+        import sys
+        if os.name == "nt":
+            os.system("")
+        sys.stdout.write("\033[2J\033[2;r\033[2;1H")
+        sys.stdout.flush()
+        self._update_title()
+
         self._task = asyncio.create_task(self._main_loop())
         logger.info(f"Task worker started (max concurrent: {MAX_CONCURRENT_REVIEWS})")
 
@@ -74,12 +105,17 @@ class TaskWorker:
                 await self._task
             except asyncio.CancelledError:
                 pass
+                
+        import sys
+        sys.stdout.write("\033[r")
+        sys.stdout.flush()
         logger.info("Task worker stopped")
 
     async def submit(self, task: ReviewTask) -> str:
         """提交任务到队列，返回 review_id"""
         await add_review(task.session_id, task.review)
         await self._queue.put(task)
+        self._update_title()
         logger.info(
             f"Review {task.review.review_id} queued for session {task.session_id}"
         )
@@ -94,11 +130,21 @@ class TaskWorker:
             except asyncio.TimeoutError:
                 continue
 
+            self._processing_count += 1
+            self._update_title()
+
+            async def wrap_process(t: ReviewTask):
+                try:
+                    await self._process_task(t)
+                finally:
+                    self._processing_count -= 1
+                    self._completed_count += 1
+                    self._update_title()
+
             # 异步启动处理（不阻塞队列消费）
-            asyncio.create_task(self._process_task(task))
+            asyncio.create_task(wrap_process(task))
 
     async def _process_task(self, task: ReviewTask):
-        """处理单个 review 任务"""
         session_id = task.session_id
         review = task.review
 
@@ -110,6 +156,7 @@ class TaskWorker:
 
                 # 更新状态为 processing
                 review.status = "processing"
+                review.started_at = _now()
                 await update_review(session_id, review)
 
                 repo_dir = _repo_dir(session_id)
@@ -135,16 +182,20 @@ class TaskWorker:
                     import time
                     KEEPALIVE_TIMEOUT = 10  # 客户端超过 30s 未轮询则停止
 
-                    process = await launch_review(task.description, repo_dir)
+                    process = await launch_review(task.description, repo_dir, fast_mode=task.fast_mode)
 
                     if task.keepalive:
                         # 轮询模式：边等 Claude Code 边检查客户端是否还在
                         cancelled = False
+                        
+                        # 把 communicate 放入后台任务中，避免 stdout 管道塞满导致子进程死锁
+                        communicate_task = asyncio.create_task(read_review_output(process, fast_mode=task.fast_mode))
+                        
                         while True:
-                            await asyncio.sleep(3)
-                            # Claude Code 跑完了？
-                            if process.returncode is not None:
+                            done, pending = await asyncio.wait([communicate_task], timeout=3.0)
+                            if communicate_task in done:
                                 break
+                            
                             # 客户端还在吗？
                             last = self._last_poll.get(review.review_id, 0)
                             if time.time() - last > KEEPALIVE_TIMEOUT:
@@ -154,18 +205,19 @@ class TaskWorker:
                                 break
 
                         if cancelled:
+                            communicate_task.cancel()
                             review.status = "cancelled"
                             review.summary = "Client disconnected, review cancelled."
                             review.completed_at = _now()
                         else:
-                            findings, summary = await read_review_output(process)
+                            findings, summary = communicate_task.result()
                             review.findings = findings
                             review.summary = summary
                             review.status = "completed"
                             review.completed_at = _now()
                     else:
                         # NoPoll 模式：跑完为止，不检查客户端
-                        findings, summary = await read_review_output(process)
+                        findings, summary = await read_review_output(process, fast_mode=task.fast_mode)
                         review.findings = findings
                         review.summary = summary
                         review.status = "completed"

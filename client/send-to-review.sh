@@ -15,6 +15,7 @@ SERVER="http://localhost:8000"
 DES=""
 LOCAL=false
 NO_POLL=false
+FAST_MODE=false
 END_SESSION=false
 POLL_INTERVAL=2
 TIMEOUT=300
@@ -59,6 +60,7 @@ Options:
   -s, --server URL      Server URL (default: http://localhost:8000)
   -l, --local           Include uncommitted local changes (requires -d)
   -n, --no-poll         Submit only, do not wait for result
+  -f, --fast            Fast mode, return plain text summary without strict JSON
   -e, --end-session     End session after review
   -p, --poll-interval N Poll interval in seconds (default: 5)
   -h, --help            Show this help
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         -s|--server)       SERVER="$2"; shift 2 ;;
         -l|--local)        LOCAL=true; shift ;;
         -n|--no-poll)      NO_POLL=true; shift ;;
+        -f|--fast)         FAST_MODE=true; shift ;;
         -e|--end-session)  END_SESSION=true; shift ;;
         -p|--poll-interval) POLL_INTERVAL="$2"; shift 2 ;;
         -h|--help)         usage ;;
@@ -169,12 +172,14 @@ if $LOCAL; then
     DESC_ESCAPED=$(json_escape "$DES")
     BODY="{\"description\":$DESC_ESCAPED,\"patch\":$PATCH_ESCAPED"
     if $NO_POLL; then BODY="$BODY,\"no_poll\":true"; fi
+    if $FAST_MODE; then BODY="$BODY,\"fast_mode\":true"; fi
     BODY="$BODY}"
     color "$YELLOW" "Including local diff ($(echo "$PATCH" | wc -c) chars)"
 else
     DESC_ESCAPED=$(json_escape "$DES")
     BODY="{\"description\":$DESC_ESCAPED"
     if $NO_POLL; then BODY="$BODY,\"no_poll\":true"; fi
+    if $FAST_MODE; then BODY="$BODY,\"fast_mode\":true"; fi
     BODY="$BODY}"
 fi
 
@@ -234,6 +239,33 @@ FINDING_COUNT=$(echo "$RESP" | json_count findings)
 printf "%b========================================%b\n" "$WHITE" "$NC"
 printf "%b  Review Complete%b\n" "$WHITE" "$NC"
 printf "%b========================================%b\n" "$WHITE" "$NC"
+
+CREATED_AT=$(echo "$RESP" | json_val created_at)
+STARTED_AT=$(echo "$RESP" | json_val started_at)
+COMPLETED_AT=$(echo "$RESP" | json_val completed_at)
+if [[ -n "$CREATED_AT" && -n "$STARTED_AT" && -n "$COMPLETED_AT" ]]; then
+    DURATION=$(echo "$RESP" | python3 -c "
+import sys, json
+from datetime import datetime
+d = json.load(sys.stdin)
+s, c = d.get('started_at'), d.get('completed_at')
+if s and c:
+    try:
+        t1 = datetime.fromisoformat(s.replace('Z', '+00:00'))
+        t2 = datetime.fromisoformat(c.replace('Z', '+00:00'))
+        print(f'{(t2 - t1).total_seconds():.1f}')
+    except Exception:
+        print('')
+")
+    if [[ -n "$DURATION" ]]; then
+        C_DISP=$(echo "$CREATED_AT" | cut -c 1-19 | tr 'T' ' ')
+        S_DISP=$(echo "$STARTED_AT" | cut -c 1-19 | tr 'T' ' ')
+        printf "%bTask Received: %s%b\n" "$GRAY" "$C_DISP" "$NC"
+        printf "%bExecution Start: %s%b\n" "$GRAY" "$S_DISP" "$NC"
+        printf "%bTotal Duration: %ss%b\n" "$GRAY" "$DURATION" "$NC"
+    fi
+fi
+
 if [[ -n "$SCOPE" ]]; then printf "%bScope: %s%b\n" "$GRAY" "$SCOPE" "$NC"; fi
 printf "%bSummary: %s%b\n" "$CYAN" "$SUMMARY" "$NC"
 printf "%bFindings: %s%b\n" "$YELLOW" "$FINDING_COUNT" "$NC"

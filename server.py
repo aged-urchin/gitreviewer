@@ -116,6 +116,7 @@ class SubmitReviewRequest(BaseModel):
     description: str = Field("", description="Review 描述，告诉模型关注什么；留空则默认 review 整个仓库")
     patch: str = Field("", description="本地未提交的 diff（客户端自动检测并附带）")
     no_poll: bool = Field(False, description="客户端不轮询，服务端跑完为止")
+    fast_mode: bool = Field(False, description="快速模式，跳过 JSON 严格验证格式，直接输出摘要")
     webhook_url: str = Field("", description="可选的回调 URL，review 完成后 POST 通知")
 
 
@@ -267,6 +268,7 @@ async def api_submit_review(
         description=body.description,
         patch=body.patch,
         keepalive=not body.no_poll,
+        fast_mode=body.fast_mode,
         webhook_url=body.webhook_url,
     )
 
